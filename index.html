@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sticky Fight</title>
+  <!-- Game styling (background, canvas appearance, layout) -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- The canvas element where the entire game is rendered -->
+  <canvas id="game"></canvas>
+
+  <!--
+    Script load order matters! Each file depends on the ones above it:
+    1. particle.js  - Particle class (no dependencies)
+    2. levels.js    - Level config data (no dependencies)
+    3. fighter.js   - Fighter class (needs Particle, level constants)
+    4. ui.js        - All drawing/UI functions (needs Fighter, canvas context)
+    5. game.js      - Main loop, input, game state (ties everything together)
+  -->
+  <script src="particle.js"></script>
+  <script src="levels.js"></script>
+  <script src="fighter.js"></script>
+  <script src="ui.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>

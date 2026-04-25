@@ -1,0 +1,29 @@
+/* ============================================
+   STICKY FIGHT - Global Styles
+   ============================================ */
+
+/* Reset all default browser margins/padding so the game
+   takes up the full viewport with no unexpected spacing */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* Center the canvas in the viewport and prevent scrolling.
+   The dark background fills any space around the canvas. */
+body {
+  background: #111;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* The game canvas - styled with a subtle border and
+   a dark blue-ish background that matches the game's color scheme */
+canvas {
+  border: 2px solid #333;
+  background: #1a1a2e;
+}
