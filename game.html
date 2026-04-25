@@ -1,0 +1,867 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sticky Fight</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; justify-content: center; align-items: center; height: 100vh; overflow: hidden; }
+  canvas { border: 2px solid #333; background: #1a1a2e; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+canvas.width = 1200;
+canvas.height = 600;
+
+const GROUND = canvas.height - 60;
+const GRAVITY = 0.6;
+const HEAVY_CHARGE_TIME = 180;
+const HEAVY_DAMAGE_MULT = 3;
+const PARRY_WINDOW = 10;
+const PARRY_SLAM_DAMAGE = 50; // more than heavy hit (heavy = 12*3=36 punch, ~47 kick)
+
+// ── Input ──
+const keys = {};
+const keyDownTime = {};
+const keyJustPressed = {};
+window.addEventListener('keydown', e => {
+  const k = e.key === ' ' ? ' ' : e.key.toLowerCase();
+  if (!keys[k]) {
+    keyDownTime[k] = 0;
+    keyJustPressed[k] = true;
+  }
+  keys[k] = true;
+  e.preventDefault();
+});
+window.addEventListener('keyup', e => {
+  const k = e.key === ' ' ? ' ' : e.key.toLowerCase();
+  keys[k] = false;
+  delete keyDownTime[k];
+  e.preventDefault();
+});
+
+// ── Game State ──
+let gameState = 'menu';
+let currentLevel = 1;
+const MAX_LEVEL = 10;
+let enemies = [];
+let particles = [];
+let shakeTimer = 0;
+let shakeIntensity = 0;
+let levelStartTimer = 0;
+let messageTimer = 0;
+let messageText = '';
+
+// ── Fighter Class ──
+class Fighter {
+  constructor(x, y, isPlayer, config = {}) {
+    this.x = x;
+    this.y = y;
+    this.vx = 0;
+    this.vy = 0;
+    this.isPlayer = isPlayer;
+    this.facing = isPlayer ? 1 : -1;
+    this.maxHP = config.maxHP || 100;
+    this.hp = this.maxHP;
+    this.speed = config.speed || 3;
+    this.damage = config.damage || 10;
+    this.color = config.color || (isPlayer ? '#00ff88' : '#ff4444');
+    this.name = config.name || (isPlayer ? 'You' : 'Enemy');
+
+    this.grounded = false;
+    this.crouching = false;
+    this.punching = false;
+    this.kicking = false;
+    this.blocking = false;
+    this.hit = false;
+    this.dead = false;
+    this.attackTimer = 0;
+    this.hitTimer = 0;
+    this.attackCooldown = 0;
+    this.isHeavyAttack = false;
+
+    this.chargingPunch = false;
+    this.chargingKick = false;
+    this.chargeTime = 0;
+
+    this.parryTimer = 0;
+    this.parrying = false;
+    this.slamming = false;
+    this.slamTimer = 0;
+    this.slamTarget = null;
+    this.slamCaughtPunch = true;
+
+    this.beingSlammed = false;
+    this.slamAnimTimer = 0;
+
+    this.walkFrame = 0;
+    this.walkTimer = 0;
+    this.idleTimer = 0;
+
+    this.aiTimer = 0;
+    this.aiAction = 'idle';
+    this.aiReactionSpeed = config.aiReactionSpeed || 60;
+    this.aiAggression = config.aiAggression || 0.3;
+    this.aiBlockChance = config.aiBlockChance || 0.1;
+  }
+
+  getClosestEnemy() {
+    let closest = null;
+    let closestDist = Infinity;
+    const targets = this.isPlayer ? enemies : [player];
+    for (const t of targets) {
+      if (t.dead) continue;
+      const d = Math.abs(this.x - t.x);
+      if (d < closestDist) { closestDist = d; closest = t; }
+    }
+    return closest;
+  }
+
+  update(target) {
+    if (this.dead) return;
+
+    if (this.beingSlammed) {
+      this.slamAnimTimer--;
+      if (this.slamAnimTimer <= 0) {
+        this.beingSlammed = false;
+        // Apply slam damage now that animation is done
+        this.hp -= PARRY_SLAM_DAMAGE;
+        this.hit = true;
+        this.hitTimer = 25;
+        this.vx = (this.x > (this.slammedFromX || this.x) ? 1 : -1) * 10;
+        this.vy = -6;
+        shakeTimer = 20;
+        shakeIntensity = 8;
+        for (let i = 0; i < 15; i++) particles.push(new Particle(this.x, this.y - 12, '#ffaa00'));
+        if (this.hp <= 0) {
+          this.hp = 0; this.dead = true;
+          for (let i = 0; i < 20; i++) particles.push(new Particle(this.x, this.y - 35, this.color));
+        }
+      }
+      return;
+    }
+
+    if (this.slamming) {
+      this.slamTimer--;
+      if (this.slamTimer <= 0) { this.slamming = false; this.slamTarget = null; }
+      return;
+    }
+
+    if (this.isPlayer) {
+      const nearest = this.getClosestEnemy();
+      if (nearest) this.facing = nearest.x > this.x ? 1 : -1;
+      this.handleInput();
+    } else {
+      this.handleAI(target);
+    }
+
+    this.vy += GRAVITY;
+    this.x += this.vx;
+    this.y += this.vy;
+
+    if (this.y >= GROUND) { this.y = GROUND; this.vy = 0; this.grounded = true; }
+    else { this.grounded = false; }
+
+    this.x = Math.max(20, Math.min(canvas.width - 20, this.x));
+
+    if (this.grounded) {
+      const allFighters = [player, ...enemies];
+      for (const other of allFighters) {
+        if (other === this || other.dead) continue;
+        const dist = Math.abs(this.x - other.x);
+        const minDist = 32;
+        if (dist < minDist && other.grounded) {
+          const push = (minDist - dist) / 2;
+          if (this.x < other.x) { this.x -= push; other.x += push; }
+          else { this.x += push; other.x -= push; }
+          this.x = Math.max(20, Math.min(canvas.width - 20, this.x));
+          other.x = Math.max(20, Math.min(canvas.width - 20, other.x));
+        }
+      }
+    }
+
+    if (this.attackTimer > 0) {
+      this.attackTimer--;
+      if (this.attackTimer === 0) { this.punching = false; this.kicking = false; this.isHeavyAttack = false; }
+    }
+    if (this.hitTimer > 0) { this.hitTimer--; if (this.hitTimer === 0) this.hit = false; }
+    if (this.attackCooldown > 0) this.attackCooldown--;
+    if (this.parryTimer > 0) { this.parryTimer--; if (this.parryTimer === 0) this.parrying = false; }
+
+    if (Math.abs(this.vx) > 0.5 && this.grounded) {
+      this.walkTimer++;
+      if (this.walkTimer > 8) { this.walkTimer = 0; this.walkFrame = (this.walkFrame + 1) % 4; }
+    } else { this.walkFrame = 0; this.walkTimer = 0; }
+
+    this.idleTimer += 0.05;
+
+    if (this.grounded && !this.isPlayer) this.vx *= 0.85;
+    else if (this.grounded) this.vx *= 0.8;
+  }
+
+  handleInput() {
+    if (this.hit) return;
+
+    this.blocking = keys[' '] && this.grounded && !this.chargingPunch && !this.chargingKick && !this.punching && !this.kicking && !this.parrying;
+
+    if (keyJustPressed['u'] && !this.punching && !this.kicking && !this.chargingPunch && !this.chargingKick && !this.blocking) {
+      this.parrying = true;
+      this.parryTimer = PARRY_WINDOW;
+    }
+
+    if (keys['j']) { if (keyDownTime['j'] !== undefined) keyDownTime['j']++; }
+    if (keys['k']) { if (keyDownTime['k'] !== undefined) keyDownTime['k']++; }
+
+    if (keys['j'] && !this.punching && !this.kicking && this.attackCooldown === 0 && !this.parrying) {
+      this.chargingPunch = true; this.chargingKick = false;
+      this.chargeTime = keyDownTime['j'] || 0;
+      if (this.chargeTime >= HEAVY_CHARGE_TIME) {
+        this.punching = true; this.isHeavyAttack = true; this.attackTimer = 20; this.attackCooldown = 30;
+        this.chargingPunch = false; this.chargeTime = 0; delete keyDownTime['j']; keys['j'] = false;
+        for (let i = 0; i < 6; i++) particles.push(new Particle(this.x + this.facing * 20, this.y - 45, '#ff3333'));
+      }
+    } else if (!keys['j'] && this.chargingPunch) {
+      if (this.attackCooldown === 0 && !this.punching && !this.kicking) {
+        this.punching = true; this.isHeavyAttack = false; this.attackTimer = 15; this.attackCooldown = 20;
+      }
+      this.chargingPunch = false; this.chargeTime = 0;
+    }
+
+    if (keys['k'] && !this.punching && !this.kicking && this.attackCooldown === 0 && !this.chargingPunch && !this.parrying) {
+      this.chargingKick = true; this.chargingPunch = false;
+      this.chargeTime = keyDownTime['k'] || 0;
+      if (this.chargeTime >= HEAVY_CHARGE_TIME) {
+        this.kicking = true; this.isHeavyAttack = true; this.attackTimer = 25; this.attackCooldown = 35;
+        this.chargingKick = false; this.chargeTime = 0; delete keyDownTime['k']; keys['k'] = false;
+        for (let i = 0; i < 6; i++) particles.push(new Particle(this.x + this.facing * 20, this.y - 20, '#ff3333'));
+      }
+    } else if (!keys['k'] && this.chargingKick) {
+      if (this.attackCooldown === 0 && !this.punching && !this.kicking) {
+        this.kicking = true; this.isHeavyAttack = false; this.attackTimer = 20; this.attackCooldown = 25;
+      }
+      this.chargingKick = false; this.chargeTime = 0;
+    }
+
+    const charging = this.chargingPunch || this.chargingKick;
+    if (keys['a'] && !this.crouching && !charging && !this.parrying) this.vx = -this.speed;
+    else if (keys['d'] && !this.crouching && !charging && !this.parrying) this.vx = this.speed;
+
+    if (keys['w'] && this.grounded && !this.crouching && !charging && !this.parrying) {
+      this.vy = -13; this.grounded = false;
+    }
+
+    this.crouching = keys['s'] && this.grounded;
+  }
+
+  handleAI(target) {
+    if (!target || target.dead || this.hit) return;
+
+    this.aiTimer++;
+    const dist = Math.abs(this.x - target.x);
+    const dir = target.x > this.x ? 1 : -1;
+    this.facing = dir;
+
+    if (this.aiTimer % Math.max(10, this.aiReactionSpeed) === 0) {
+      const r = Math.random();
+      if (dist > 140) {
+        this.aiAction = r < 0.9 ? 'approach' : 'jumpAttack';
+      } else if (dist < 75) {
+        if (r < this.aiAggression * 1.5) {
+          this.aiAction = Math.random() < 0.5 ? 'punch' : 'kick';
+        } else if (r < this.aiAggression * 1.5 + this.aiBlockChance) {
+          this.aiAction = 'crouchBlock';
+        } else {
+          this.aiAction = 'approach';
+        }
+      } else {
+        if (r < 0.6) this.aiAction = 'approach';
+        else if (r < 0.6 + this.aiAggression) this.aiAction = Math.random() < 0.5 ? 'punch' : 'kick';
+        else this.aiAction = Math.random() < 0.3 ? 'jumpAttack' : 'approach';
+      }
+    }
+
+    switch (this.aiAction) {
+      case 'approach':
+        this.vx = dir * this.speed; this.blocking = false; this.crouching = false; break;
+      case 'retreat':
+        this.vx = -dir * this.speed * 0.6; this.blocking = false; this.crouching = false; break;
+      case 'punch':
+        this.blocking = false; this.crouching = false;
+        if (dist > 75) this.vx = dir * this.speed;
+        else if (this.attackCooldown === 0) {
+          this.punching = true; this.isHeavyAttack = false; this.attackTimer = 15; this.attackCooldown = 18; this.aiAction = 'approach';
+        }
+        break;
+      case 'kick':
+        this.blocking = false; this.crouching = false;
+        if (dist > 85) this.vx = dir * this.speed;
+        else if (this.attackCooldown === 0) {
+          this.kicking = true; this.isHeavyAttack = false; this.attackTimer = 20; this.attackCooldown = 22; this.aiAction = 'approach';
+        }
+        break;
+      case 'jumpAttack':
+        this.blocking = false; this.crouching = false;
+        if (this.grounded) { this.vy = -11; this.vx = dir * this.speed; }
+        this.aiAction = 'punch'; break;
+      case 'crouchBlock':
+        this.blocking = true; this.crouching = true;
+        if (this.aiTimer % 30 === 0) { this.aiAction = 'approach'; this.crouching = false; this.blocking = false; }
+        break;
+      default:
+        if (dist > 120) this.vx = dir * this.speed * 0.4; break;
+    }
+  }
+
+  getAttackBox() {
+    const heavyBonus = this.isHeavyAttack ? 12 : 0;
+    if (this.punching) {
+      return { x: this.x + this.facing * 25, y: this.y - (this.crouching ? 30 : 48), w: 35 + heavyBonus, h: 12 + heavyBonus };
+    }
+    if (this.kicking) {
+      return { x: this.x + this.facing * 20, y: this.y - (this.crouching ? 12 : 18), w: 40 + heavyBonus, h: 14 + heavyBonus };
+    }
+    return null;
+  }
+
+  getHurtBox() {
+    const h = this.crouching ? 38 : 72;
+    return { x: this.x - 14, y: this.y - h, w: 28, h: h };
+  }
+
+  takeDamage(amount, fromX, isHeavy, isPunch) {
+    if (this.hit || this.beingSlammed) return;
+
+    // Block logic: only crouch+block stops kicks. Standing block stops punches only.
+    // Heavy hits go through all blocks.
+    if (this.blocking && !isHeavy) {
+      if (this.crouching && !isPunch) {
+        // Crouching block stops kicks
+        for (let i = 0; i < 4; i++) particles.push(new Particle(this.x, this.y - 20, '#4488ff'));
+        return;
+      } else if (!this.crouching && isPunch) {
+        // Standing block stops punches
+        for (let i = 0; i < 4; i++) particles.push(new Particle(this.x, this.y - 40, '#4488ff'));
+        return;
+      }
+      // Standing + kick = NOT blocked (kick lands)
+      // Crouching + punch = NOT blocked (punch lands)
+    }
+
+    this.hp -= amount;
+    this.hit = true;
+    this.hitTimer = isHeavy ? 25 : 15;
+    this.vx = (this.x > fromX ? 1 : -1) * (isHeavy ? 10 : 5);
+    this.vy = isHeavy ? -6 : -3;
+
+    shakeTimer = isHeavy ? 15 : 8;
+    shakeIntensity = isHeavy ? amount / 2 : amount / 3;
+
+    const pCount = isHeavy ? 15 : 8;
+    for (let i = 0; i < pCount; i++) particles.push(new Particle(this.x, this.y - 35, isHeavy ? '#ff0000' : this.color));
+
+    if (this.hp <= 0) {
+      this.hp = 0; this.dead = true;
+      for (let i = 0; i < 20; i++) particles.push(new Particle(this.x, this.y - 35, this.color));
+    }
+  }
+
+  draw() {
+    if (this.dead) return;
+
+    ctx.save();
+    ctx.translate(this.x, this.y);
+
+    // Taller proportions
+    const headR = 10;
+    const bodyLen = this.crouching ? 22 : 40;
+    const armLen = 20;
+    const legLen = 24;
+
+    const col = this.hit && this.hitTimer % 4 < 2 ? '#ffffff' : this.color;
+    const drawCol = this.blocking ? '#4488ff' : (this.parrying ? '#ffff00' : col);
+
+    ctx.strokeStyle = drawCol;
+    ctx.fillStyle = drawCol;
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+
+    const headY = -bodyLen - headR - 2;
+    const breathOffset = Math.sin(this.idleTimer) * 1.2;
+
+    // ── Slam animation ──
+    if (this.slamming && this.slamTarget) {
+      const progress = 1 - (this.slamTimer / 30);
+      ctx.beginPath(); ctx.arc(0, headY + breathOffset, headR, 0, Math.PI * 2); ctx.stroke();
+      ctx.fillRect(this.facing * 3 - 1, headY - 2 + breathOffset, 3, 3);
+      ctx.beginPath(); ctx.moveTo(0, -bodyLen + breathOffset); ctx.lineTo(0, 0); ctx.stroke();
+      const grabAngle = -Math.PI * 0.3 + progress * Math.PI * 1.0;
+      const handX = this.facing * Math.cos(grabAngle) * (armLen + 5);
+      const handY = -bodyLen + 10 + Math.sin(grabAngle) * (armLen + 5) + breathOffset;
+      ctx.beginPath(); ctx.moveTo(0, -bodyLen + 10 + breathOffset); ctx.lineTo(handX, handY); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -bodyLen + 10 + breathOffset); ctx.lineTo(-this.facing * 10, -bodyLen + 22 + breathOffset); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-10, legLen); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(10, legLen); ctx.stroke();
+      ctx.restore(); return;
+    }
+
+    // ── Being slammed ──
+    if (this.beingSlammed) {
+      const progress = 1 - (this.slamAnimTimer / 30);
+      ctx.rotate(progress * Math.PI * 1.5);
+      ctx.beginPath(); ctx.arc(0, headY, headR, 0, Math.PI * 2); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -bodyLen); ctx.lineTo(0, 0); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -bodyLen + 10); ctx.lineTo(-8, -bodyLen + 25); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, -bodyLen + 10); ctx.lineTo(8, -bodyLen + 25); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-6, legLen); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(6, legLen); ctx.stroke();
+      ctx.restore(); return;
+    }
+
+    // ── Normal drawing ──
+
+    // Head
+    ctx.beginPath(); ctx.arc(0, headY + breathOffset, headR, 0, Math.PI * 2); ctx.stroke();
+    // Eyes
+    ctx.fillStyle = drawCol;
+    ctx.fillRect(this.facing * 4 - 1, headY - 2 + breathOffset, 3, 3);
+
+    // Body
+    ctx.beginPath(); ctx.moveTo(0, -bodyLen + breathOffset); ctx.lineTo(0, 0); ctx.stroke();
+
+    // ── Arms (no joints) ──
+    const shoulderY = -bodyLen + 10 + breathOffset;
+
+    if (this.blocking && !this.punching && !this.kicking) {
+      // Blocking pose - arms crossed
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * 8, shoulderY - 10); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * 12, shoulderY - 5); ctx.stroke();
+    } else if (this.parrying && !this.punching && !this.kicking) {
+      // Parry stance - arms out ready to grab
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * (armLen - 2), shoulderY - 8); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * (armLen - 4), shoulderY + 4); ctx.stroke();
+    } else if (this.punching && this.attackTimer > 5) {
+      // Punch extended
+      const fistX = this.facing * (armLen + 12);
+      const fistY = shoulderY - 2;
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(fistX, fistY); ctx.stroke();
+      ctx.fillStyle = this.isHeavyAttack ? '#ff0000' : drawCol;
+      ctx.beginPath(); ctx.arc(fistX + this.facing * 2, fistY, this.isHeavyAttack ? 7 : 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = drawCol;
+      // Other arm
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(-this.facing * armLen * 0.5, shoulderY + 10); ctx.stroke();
+    } else if (this.chargingPunch) {
+      const chargeProgress = Math.min(this.chargeTime / HEAVY_CHARGE_TIME, 1);
+      const ballRadius = 3 + chargeProgress * 12;
+      const fistX = -this.facing * (armLen * 0.7);
+      const fistY = shoulderY - 5;
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(fistX, fistY); ctx.stroke();
+      ctx.fillStyle = `rgba(255, 0, 0, ${0.2 + chargeProgress * 0.3})`;
+      ctx.beginPath(); ctx.arc(fistX, fistY, ballRadius + 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = `rgba(255, ${Math.floor(50 - chargeProgress * 50)}, 0, ${0.5 + chargeProgress * 0.5})`;
+      ctx.beginPath(); ctx.arc(fistX, fistY, ballRadius, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = `rgba(255, 255, ${Math.floor(200 - chargeProgress * 200)}, ${chargeProgress})`;
+      ctx.beginPath(); ctx.arc(fistX, fistY, ballRadius * 0.4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = drawCol;
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * armLen * 0.4, shoulderY + 8); ctx.stroke();
+    } else if (this.chargingKick) {
+      // Normal arms while charging kick
+      const armSwing = this.grounded ? Math.sin(this.walkFrame * 1.5) * 6 : 0;
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(-this.facing * armLen * 0.6, shoulderY + 12 + armSwing); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * armLen * 0.6, shoulderY + 12 - armSwing); ctx.stroke();
+    } else {
+      // Normal arms
+      const armSwing = this.grounded ? Math.sin(this.walkFrame * 1.5) * 6 : 0;
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(-this.facing * armLen * 0.6, shoulderY + 12 + armSwing); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, shoulderY); ctx.lineTo(this.facing * armLen * 0.6, shoulderY + 12 - armSwing); ctx.stroke();
+    }
+
+    // ── Legs (no joints) ──
+    if (this.kicking && this.attackTimer > 5) {
+      const footX = this.facing * (legLen + 12);
+      const footY = -10;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(footX, footY); ctx.stroke();
+      ctx.fillStyle = this.isHeavyAttack ? '#ff0000' : drawCol;
+      ctx.beginPath(); ctx.arc(footX + this.facing * 2, footY, this.isHeavyAttack ? 7 : 3, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = drawCol;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-this.facing * 8, legLen * 0.6); ctx.stroke();
+    } else if (this.chargingKick) {
+      const chargeProgress = Math.min(this.chargeTime / HEAVY_CHARGE_TIME, 1);
+      const ballRadius = 3 + chargeProgress * 12;
+      const footX = -this.facing * 14;
+      const footY = legLen * 0.6;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(footX, footY); ctx.stroke();
+      ctx.fillStyle = `rgba(255, 0, 0, ${0.2 + chargeProgress * 0.3})`;
+      ctx.beginPath(); ctx.arc(footX, footY, ballRadius + 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = `rgba(255, ${Math.floor(50 - chargeProgress * 50)}, 0, ${0.5 + chargeProgress * 0.5})`;
+      ctx.beginPath(); ctx.arc(footX, footY, ballRadius, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = `rgba(255, 255, ${Math.floor(200 - chargeProgress * 200)}, ${chargeProgress})`;
+      ctx.beginPath(); ctx.arc(footX, footY, ballRadius * 0.4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = drawCol;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(4, legLen); ctx.stroke();
+    } else if (this.crouching) {
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-12, legLen * 0.4); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(12, legLen * 0.4); ctx.stroke();
+    } else if (!this.grounded) {
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-8, legLen * 0.7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(8, legLen * 0.5); ctx.stroke();
+    } else {
+      const legSwing = Math.sin(this.walkFrame * 1.5) * 10;
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(-5 + legSwing, legLen); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(5 - legSwing, legLen); ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+}
+
+// ── Particle Class ──
+class Particle {
+  constructor(x, y, color) {
+    this.x = x; this.y = y;
+    this.vx = (Math.random() - 0.5) * 8;
+    this.vy = (Math.random() - 0.5) * 8;
+    this.life = 20 + Math.random() * 15;
+    this.maxLife = this.life;
+    this.color = color;
+    this.size = 2 + Math.random() * 3;
+  }
+  update() { this.x += this.vx; this.y += this.vy; this.vy += 0.2; this.life--; }
+  draw() {
+    const alpha = this.life / this.maxLife;
+    ctx.globalAlpha = alpha; ctx.fillStyle = this.color;
+    ctx.fillRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ── Level Configuration ──
+function getLevelConfig(level) {
+  const configs = {
+    1:  { name: 'Training Dummy', enemies: [{ maxHP: 50, speed: 1.5, damage: 5, aiReactionSpeed: 40, aiAggression: 0.3, aiBlockChance: 0.0, color: '#888888', name: 'Dummy' }] },
+    2:  { name: 'Street Thug', enemies: [{ maxHP: 70, speed: 2.5, damage: 8, aiReactionSpeed: 30, aiAggression: 0.45, aiBlockChance: 0.05, color: '#cc6633', name: 'Thug' }] },
+    3:  { name: 'Brawler Duo', enemies: [
+      { maxHP: 60, speed: 2.5, damage: 7, aiReactionSpeed: 25, aiAggression: 0.5, aiBlockChance: 0.05, color: '#cc3333', name: 'Brawler A' },
+      { maxHP: 60, speed: 2.5, damage: 7, aiReactionSpeed: 30, aiAggression: 0.45, aiBlockChance: 0.05, color: '#cc5555', name: 'Brawler B' }
+    ]},
+    4:  { name: 'Quick Fighter', enemies: [{ maxHP: 80, speed: 4, damage: 10, aiReactionSpeed: 20, aiAggression: 0.55, aiBlockChance: 0.1, color: '#ffaa00', name: 'Speedster' }] },
+    5:  { name: 'Heavy Hitter', enemies: [{ maxHP: 150, speed: 2, damage: 18, aiReactionSpeed: 25, aiAggression: 0.5, aiBlockChance: 0.15, color: '#8844aa', name: 'Bruiser' }] },
+    6:  { name: 'The Twins', enemies: [
+      { maxHP: 80, speed: 3.5, damage: 10, aiReactionSpeed: 18, aiAggression: 0.55, aiBlockChance: 0.1, color: '#44aaff', name: 'Twin A' },
+      { maxHP: 80, speed: 3.5, damage: 10, aiReactionSpeed: 18, aiAggression: 0.55, aiBlockChance: 0.1, color: '#4488ff', name: 'Twin B' }
+    ]},
+    7:  { name: 'Ninja', enemies: [{ maxHP: 90, speed: 4.5, damage: 14, aiReactionSpeed: 15, aiAggression: 0.6, aiBlockChance: 0.2, color: '#333366', name: 'Ninja' }] },
+    8:  { name: 'Gang Rush', enemies: [
+      { maxHP: 55, speed: 3, damage: 8, aiReactionSpeed: 20, aiAggression: 0.55, aiBlockChance: 0.05, color: '#ff3366', name: 'Gang 1' },
+      { maxHP: 55, speed: 3, damage: 8, aiReactionSpeed: 22, aiAggression: 0.5, aiBlockChance: 0.05, color: '#ff5588', name: 'Gang 2' },
+      { maxHP: 55, speed: 3, damage: 8, aiReactionSpeed: 25, aiAggression: 0.5, aiBlockChance: 0.05, color: '#ff77aa', name: 'Gang 3' }
+    ]},
+    9:  { name: 'Shadow Master', enemies: [{ maxHP: 130, speed: 4, damage: 16, aiReactionSpeed: 12, aiAggression: 0.65, aiBlockChance: 0.25, color: '#220033', name: 'Shadow' }] },
+    10: { name: 'Final Boss', enemies: [{ maxHP: 200, speed: 3.5, damage: 20, aiReactionSpeed: 10, aiAggression: 0.7, aiBlockChance: 0.3, color: '#ff0000', name: 'Champion' }] }
+  };
+  return configs[level];
+}
+
+// ── Player Setup ──
+let player = new Fighter(200, GROUND, true, { maxHP: 100, speed: 4, damage: 12 });
+
+function startLevel(level) {
+  const config = getLevelConfig(level);
+  enemies = [];
+  config.enemies.forEach((ec, i) => {
+    const ex = canvas.width - 250 - i * 90;
+    enemies.push(new Fighter(ex, GROUND, false, ec));
+  });
+  player.hp = player.maxHP; player.dead = false; player.x = 180; player.y = GROUND;
+  player.vx = 0; player.vy = 0; player.hit = false; player.hitTimer = 0;
+  player.punching = false; player.kicking = false; player.blocking = false;
+  player.chargingPunch = false; player.chargingKick = false; player.chargeTime = 0;
+  player.isHeavyAttack = false; player.attackTimer = 0; player.attackCooldown = 0;
+  player.parrying = false; player.parryTimer = 0; player.slamming = false;
+  player.slamTimer = 0; player.slamTarget = null;
+  gameState = 'fighting'; levelStartTimer = 90;
+  messageText = `Level ${level}: ${config.name}`; messageTimer = 90; particles = [];
+}
+
+// ── Collision Detection ──
+function boxOverlap(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function checkAttacks() {
+  const pAtk = player.getAttackBox();
+  if (pAtk && player.attackTimer === (player.punching ? 12 : 16)) {
+    enemies.forEach(e => {
+      if (e.dead) return;
+      const hBox = e.getHurtBox();
+      if (boxOverlap(pAtk, hBox)) {
+        let dmg = player.kicking ? player.damage * 1.3 : player.damage;
+        if (player.isHeavyAttack) dmg *= HEAVY_DAMAGE_MULT;
+        e.takeDamage(Math.round(dmg), player.x, player.isHeavyAttack, player.punching);
+      }
+    });
+  }
+
+  enemies.forEach(e => {
+    if (e.dead) return;
+    const eAtk = e.getAttackBox();
+    const hitFrame = e.punching ? 12 : 16;
+    if (eAtk && e.attackTimer === hitFrame) {
+      const hBox = player.getHurtBox();
+      if (boxOverlap(eAtk, hBox)) {
+        if (player.parrying && player.parryTimer > 0) {
+          performSlam(player, e, e.punching); return;
+        }
+        let dmg = e.kicking ? e.damage * 1.3 : e.damage;
+        if (e.isHeavyAttack) dmg *= HEAVY_DAMAGE_MULT;
+        player.takeDamage(Math.round(dmg), e.x, e.isHeavyAttack, e.punching);
+      }
+    }
+  });
+}
+
+function performSlam(parrier, attacker, caughtPunch) {
+  parrier.parrying = false; parrier.parryTimer = 0;
+  parrier.slamming = true; parrier.slamTimer = 30;
+  parrier.slamTarget = attacker; parrier.slamCaughtPunch = caughtPunch;
+
+  attacker.punching = false; attacker.kicking = false; attacker.attackTimer = 0;
+  attacker.beingSlammed = true; attacker.slamAnimTimer = 30;
+  attacker.slammedFromX = parrier.x; // store for knockback direction
+
+  messageText = caughtPunch ? 'PARRY! Caught the fist!' : 'PARRY! Caught the foot!';
+  messageTimer = 60;
+
+  for (let i = 0; i < 12; i++) particles.push(new Particle(attacker.x, attacker.y - 35, '#ffff00'));
+}
+
+// ── Drawing Functions ──
+function drawGround() {
+  ctx.strokeStyle = '#444'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, GROUND + 24); ctx.lineTo(canvas.width, GROUND + 24); ctx.stroke();
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 1;
+  for (let i = 0; i < canvas.width; i += 40) {
+    ctx.beginPath(); ctx.moveTo(i, GROUND + 26); ctx.lineTo(i + 20, GROUND + 26); ctx.stroke();
+  }
+}
+
+function drawHealthBar(x, y, w, h, hp, maxHP, color, name) {
+  ctx.fillStyle = '#333'; ctx.fillRect(x, y, w, h);
+  const ratio = hp / maxHP;
+  ctx.fillStyle = ratio > 0.5 ? color : ratio > 0.25 ? '#ffaa00' : '#ff3333';
+  ctx.fillRect(x + 1, y + 1, (w - 2) * ratio, h - 2);
+  ctx.strokeStyle = '#666'; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+  ctx.fillStyle = '#fff'; ctx.font = '12px monospace'; ctx.fillText(name, x, y - 4);
+  ctx.font = '10px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(`${hp}/${maxHP}`, x + w / 2, y + h - 3); ctx.textAlign = 'left';
+}
+
+function drawHUD() {
+  drawHealthBar(20, 20, 220, 20, player.hp, player.maxHP, '#00ff88', 'You');
+  enemies.forEach((e, i) => { if (!e.dead) drawHealthBar(canvas.width - 240, 20 + i * 32, 220, 20, e.hp, e.maxHP, e.color, e.name); });
+
+  ctx.fillStyle = '#888'; ctx.font = '15px monospace'; ctx.textAlign = 'center';
+  ctx.fillText(`Level ${currentLevel} / ${MAX_LEVEL}`, canvas.width / 2, 22); ctx.textAlign = 'left';
+
+  if (player.blocking) {
+    ctx.fillStyle = '#4488ff'; ctx.font = 'bold 13px monospace';
+    ctx.fillText(player.crouching ? 'CROUCH BLOCK (stops kicks)' : 'STAND BLOCK (stops punches)', 20, 60);
+  }
+  if (player.parrying) {
+    ctx.fillStyle = '#ffff00'; ctx.font = 'bold 13px monospace'; ctx.fillText('PARRY READY', 20, 60);
+  }
+  if (player.chargingPunch || player.chargingKick) {
+    const progress = Math.min(player.chargeTime / HEAVY_CHARGE_TIME, 1);
+    ctx.fillStyle = '#333'; ctx.fillRect(20, 68, 110, 10);
+    ctx.fillStyle = `rgb(255, ${Math.floor(255 - progress * 255)}, 0)`;
+    ctx.fillRect(20, 68, 110 * progress, 10);
+    ctx.strokeStyle = '#666'; ctx.strokeRect(20, 68, 110, 10);
+    ctx.fillStyle = '#fff'; ctx.font = '9px monospace'; ctx.fillText('HEAVY CHARGE', 20, 66);
+  }
+
+  ctx.fillStyle = '#444'; ctx.font = '10px monospace';
+  ctx.fillText('WASD: Move/Jump/Crouch | J: Punch | K: Kick | SPACE: Block | U: Parry | Hold J/K: Heavy', 20, canvas.height - 12);
+}
+
+function drawMessage() {
+  if (messageTimer > 0) {
+    messageTimer--;
+    ctx.globalAlpha = messageTimer > 20 ? 1 : messageTimer / 20;
+    ctx.fillStyle = '#fff'; ctx.font = 'bold 30px monospace'; ctx.textAlign = 'center';
+    ctx.fillText(messageText, canvas.width / 2, canvas.height / 2 - 70);
+    ctx.textAlign = 'left'; ctx.globalAlpha = 1;
+  }
+}
+
+// ── Jump Kick Logo Stick Figure ──
+function drawJumpKickLogo(x, y, scale, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.strokeStyle = color;
+  ctx.fillStyle = color;
+  ctx.lineWidth = 3.5 * scale;
+  ctx.lineCap = 'round';
+
+  const s = scale;
+
+  // Head
+  ctx.beginPath(); ctx.arc(0, -50 * s, 10 * s, 0, Math.PI * 2); ctx.stroke();
+  // Eyes (fierce)
+  ctx.fillRect(3 * s, -52 * s, 3 * s, 3 * s);
+
+  // Body - leaning forward slightly
+  ctx.beginPath(); ctx.moveTo(0, -40 * s); ctx.lineTo(-5 * s, -5 * s); ctx.stroke();
+
+  // Back arm - pulled back
+  ctx.beginPath(); ctx.moveTo(-3 * s, -32 * s); ctx.lineTo(-22 * s, -20 * s); ctx.stroke();
+
+  // Front arm - punching forward
+  ctx.beginPath(); ctx.moveTo(-2 * s, -32 * s); ctx.lineTo(20 * s, -35 * s); ctx.stroke();
+  // Fist
+  ctx.beginPath(); ctx.arc(22 * s, -35 * s, 3 * s, 0, Math.PI * 2); ctx.fill();
+
+  // Back leg - trailing behind and up
+  ctx.beginPath(); ctx.moveTo(-5 * s, -5 * s); ctx.lineTo(-25 * s, -15 * s); ctx.stroke();
+
+  // Front leg - flying kick extended forward and down
+  ctx.beginPath(); ctx.moveTo(-5 * s, -5 * s); ctx.lineTo(30 * s, 5 * s); ctx.stroke();
+  // Foot
+  ctx.beginPath(); ctx.arc(32 * s, 5 * s, 3 * s, 0, Math.PI * 2); ctx.fill();
+
+  ctx.restore();
+}
+
+function drawMenu() {
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Title
+  ctx.fillStyle = '#00ff88';
+  ctx.font = 'bold 56px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('STICKY FIGHT', canvas.width / 2, 130);
+
+  // Subtitle
+  ctx.fillStyle = '#887744';
+  ctx.font = 'italic 18px monospace';
+  ctx.fillText('Created by Reece and Cass', canvas.width / 2, 165);
+
+  // Jump kick logo stick figure
+  drawJumpKickLogo(canvas.width / 2, 300, 1.8, '#00ff88');
+
+  // Instructions
+  ctx.fillStyle = '#aaa';
+  ctx.font = '17px monospace';
+  ctx.fillText('Press ENTER to start', canvas.width / 2, 440);
+
+  ctx.font = '13px monospace';
+  ctx.fillStyle = '#666';
+  ctx.fillText('WASD - Move / Jump / Crouch', canvas.width / 2, 485);
+  ctx.fillText('J - Punch  |  K - Kick  |  SPACE - Block', canvas.width / 2, 510);
+  ctx.fillText('U - Parry (time it to grab & slam!)', canvas.width / 2, 535);
+  ctx.fillText('Hold J or K for 3s - HEAVY HIT (unblockable!)', canvas.width / 2, 560);
+  ctx.fillText('Stand Block = stops punches | Crouch Block = stops kicks', canvas.width / 2, 585);
+  ctx.fillText('Kicks go through standing block!', canvas.width / 2, 610);
+  ctx.textAlign = 'left';
+}
+
+function drawLevelComplete() {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#00ff88'; ctx.font = 'bold 40px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('LEVEL COMPLETE!', canvas.width / 2, canvas.height / 2 - 30);
+  ctx.fillStyle = '#aaa'; ctx.font = '20px monospace';
+  ctx.fillText(`Level ${currentLevel} cleared!`, canvas.width / 2, canvas.height / 2 + 15);
+  ctx.fillText('Press ENTER for next level', canvas.width / 2, canvas.height / 2 + 55);
+  ctx.textAlign = 'left';
+}
+
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.7)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#ff3333'; ctx.font = 'bold 44px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('DEFEATED', canvas.width / 2, canvas.height / 2 - 30);
+  ctx.fillStyle = '#aaa'; ctx.font = '20px monospace';
+  ctx.fillText(`Fell on Level ${currentLevel}`, canvas.width / 2, canvas.height / 2 + 15);
+  ctx.fillText('Press ENTER to retry', canvas.width / 2, canvas.height / 2 + 55);
+  ctx.fillText('Press ESC for menu', canvas.width / 2, canvas.height / 2 + 90);
+  ctx.textAlign = 'left';
+}
+
+function drawVictory() {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#ffaa00'; ctx.font = 'bold 48px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('CHAMPION!', canvas.width / 2, canvas.height / 2 - 40);
+  ctx.fillStyle = '#00ff88'; ctx.font = '24px monospace';
+  ctx.fillText('You defeated all 10 levels!', canvas.width / 2, canvas.height / 2 + 15);
+  ctx.fillStyle = '#aaa'; ctx.font = '18px monospace';
+  ctx.fillText('Press ENTER to play again', canvas.width / 2, canvas.height / 2 + 65);
+  ctx.textAlign = 'left';
+}
+
+// ── Main Game Loop ──
+let enterPressed = false;
+let escPressed = false;
+
+function update() {
+  if (keys['enter'] && !enterPressed) {
+    enterPressed = true;
+    if (gameState === 'menu') {
+      currentLevel = 1; player = new Fighter(200, GROUND, true, { maxHP: 100, speed: 4, damage: 12 }); startLevel(currentLevel);
+    } else if (gameState === 'levelComplete') {
+      currentLevel++; player.maxHP = 100 + (currentLevel - 1) * 5; startLevel(currentLevel);
+    } else if (gameState === 'gameOver') { startLevel(currentLevel); }
+    else if (gameState === 'victory') {
+      currentLevel = 1; player = new Fighter(200, GROUND, true, { maxHP: 100, speed: 4, damage: 12 }); gameState = 'menu';
+    }
+  }
+  if (!keys['enter']) enterPressed = false;
+
+  if (keys['escape'] && !escPressed) { escPressed = true; if (gameState === 'gameOver') gameState = 'menu'; }
+  if (!keys['escape']) escPressed = false;
+
+  if (gameState !== 'fighting') return;
+  if (levelStartTimer > 0) { levelStartTimer--; return; }
+
+  player.update(null);
+  enemies.forEach(e => e.update(player));
+  checkAttacks();
+
+  for (const k in keyJustPressed) delete keyJustPressed[k];
+
+  particles.forEach(p => p.update());
+  particles = particles.filter(p => p.life > 0);
+
+  if (player.dead) gameState = 'gameOver';
+  else if (enemies.every(e => e.dead)) gameState = currentLevel >= MAX_LEVEL ? 'victory' : 'levelComplete';
+}
+
+function draw() {
+  ctx.save();
+  if (shakeTimer > 0) {
+    shakeTimer--;
+    ctx.translate((Math.random() - 0.5) * shakeIntensity, (Math.random() - 0.5) * shakeIntensity);
+  }
+  ctx.fillStyle = '#1a1a2e'; ctx.fillRect(-10, -10, canvas.width + 20, canvas.height + 20);
+
+  if (gameState === 'menu') { drawMenu(); ctx.restore(); return; }
+
+  drawGround();
+  enemies.forEach(e => e.draw());
+  player.draw();
+  particles.forEach(p => p.draw());
+  drawHUD();
+  drawMessage();
+
+  if (gameState === 'levelComplete') drawLevelComplete();
+  if (gameState === 'gameOver') drawGameOver();
+  if (gameState === 'victory') drawVictory();
+  ctx.restore();
+}
+
+function gameLoop() { update(); draw(); requestAnimationFrame(gameLoop); }
+gameLoop();
+</script>
+</body>
+</html>
